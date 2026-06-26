@@ -1174,11 +1174,8 @@ save_plot_legend(
 )
 
 # ==============================================================================
-# OPTIONAL FINAL ANALYSIS
+# SUPPLEMENTARY FINAL ANALYSIS
 # Gene-length sensitivity across ranked RNAPII-gain genes
-#
-# This complete final section can be removed without affecting any preceding
-# table, statistical test or plot.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
