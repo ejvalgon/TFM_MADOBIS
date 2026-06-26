@@ -1,0 +1,896 @@
+# ==============================================================================
+# ChIP-seq Snakemake workflow
+# ==============================================================================
+# This Snakefile defines the global configuration, sample discovery logic,
+# metadata parsing, final workflow targets and module imports for the ChIP-seq
+# pipeline.
+#
+# The actual processing, quality control and peak calling rules are implemented
+# in separate workflow modules:
+#   - workflow/main_workflow.smk
+#   - workflow/main_qc.smk
+#   - workflow/peak_calling.smk
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------------------------
+
+import glob
+import os
+import pandas as pd
+
+# ------------------------------------------------------------------------------
+# Project-level paths
+# ------------------------------------------------------------------------------
+
+# Root directory from which the workflow is executed.
+PROJECT_DIR = os.getcwd()
+
+# Directory containing Conda environment YAML files.
+ENV_DIR = os.path.join(PROJECT_DIR, "envs")
+
+# Directory containing custom helper scripts used by the workflow.
+SCRIPT_DIR = os.path.join(PROJECT_DIR, "scripts")
+
+# ------------------------------------------------------------------------------
+# Configuration file
+# ------------------------------------------------------------------------------
+
+configfile: "config/config.yaml"
+
+# ------------------------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------------------------
+# These functions are used to discover input samples, resolve FASTQ paths and
+# retrieve optional user-defined resource parameters from the configuration file.
+
+def get_samples(path, file_ext):
+    """
+    Detect sample names from raw FASTQ files.
+
+    For paired-end data, both common naming conventions are supported:
+    *_R1_001 / *_R2_001 and *_R1 / *_R2.
+    For single-end data, the sample name is inferred directly from the FASTQ
+    filename by removing the configured extension.
+    """
+
+    files = glob.glob(os.path.join(path, f"**/*.{file_ext}"), recursive=True)
+    samples = set()
+
+    if LAYOUT == "PAIRED":
+        for f in files:
+            bn = os.path.basename(f)
+
+            if bn.endswith(f"_R1_001.{file_ext}"):
+                samples.add(bn.replace(f"_R1_001.{file_ext}", ""))
+            elif bn.endswith(f"_R2_001.{file_ext}"):
+                samples.add(bn.replace(f"_R2_001.{file_ext}", ""))
+
+            elif bn.endswith(f"_R1.{file_ext}"):
+                samples.add(bn.replace(f"_R1.{file_ext}", ""))
+            elif bn.endswith(f"_R2.{file_ext}"):
+                samples.add(bn.replace(f"_R2.{file_ext}", ""))
+
+    else:
+        for f in files:
+            bn = os.path.basename(f)
+            samples.add(bn.replace(f".{file_ext}", ""))
+
+    return samples
+
+
+def get_raw_reads(wcs):
+    """
+    Return the raw FASTQ file(s) associated with a sample wildcard.
+
+    The function searches recursively under RAW_FASTQ_DIR and raises an error if
+    no matching FASTQ files are found or if multiple valid matches are detected.
+    """
+
+    if LAYOUT == "PAIRED":
+        patterns = [
+            (
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R1_001.{EXT}"),
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R2_001.{EXT}")
+            ),
+            (
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R1.{EXT}"),
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R2.{EXT}")
+            )
+        ]
+
+        matches = []
+
+        for r1_pattern, r2_pattern in patterns:
+            r1_matches = sorted(glob.glob(r1_pattern, recursive=True))
+            r2_matches = sorted(glob.glob(r2_pattern, recursive=True))
+
+            if len(r1_matches) == 1 and len(r2_matches) == 1:
+                matches.append((r1_matches[0], r2_matches[0]))
+
+            elif len(r1_matches) > 1 or len(r2_matches) > 1:
+                raise ValueError(
+                    f"ERROR: multiple FASTQ files found for sample={wcs.sample}\n"
+                    f"R1 matches: {r1_matches}\n"
+                    f"R2 matches: {r2_matches}\n"
+                    f"Please make RAW_FASTQ_DIR more specific or remove duplicate files."
+                )
+
+        if len(matches) == 1:
+            return list(matches[0])
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"ERROR: multiple valid paired FASTQ naming patterns found for sample={wcs.sample}: {matches}\n"
+                f"Please keep only one naming convention: either _R1_001/_R2_001 or _R1/_R2."
+            )
+
+        raise FileNotFoundError(
+            f"ERROR: paired FASTQ files not found for sample={wcs.sample} under {RAW_FASTQ_DIR}"
+        )
+
+    elif LAYOUT == "SINGLE":
+        pattern = os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}.{EXT}")
+        matches = sorted(glob.glob(pattern, recursive=True))
+
+        if len(matches) == 1:
+            return matches[0]
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"ERROR: multiple FASTQ files found for sample={wcs.sample}\n"
+                f"Matches: {matches}\n"
+                f"Please make RAW_FASTQ_DIR more specific or remove duplicate files."
+            )
+
+        raise FileNotFoundError(
+            f"ERROR: single-end FASTQ file not found for sample={wcs.sample} under {RAW_FASTQ_DIR}"
+        )
+
+
+def custom_param(param, default):
+    """
+    Return a user-defined configuration parameter or a rule-level default value.
+
+    This allows selected runtime resources to be overridden in the config file
+    without requiring every parameter to be explicitly defined.
+    """
+
+    try:
+        return config[param]
+
+    except KeyError:
+        return default
+
+# ------------------------------------------------------------------------------
+# Global configuration variables
+# ------------------------------------------------------------------------------
+# Core configuration values are normalized here and reused across workflow modules.
+
+LAYOUT = str(config["layout"]).strip().upper()
+if LAYOUT not in ["PAIRED", "SINGLE"]:
+    raise ValueError("ERROR: layout must be either 'PAIRED' or 'SINGLE'.")
+ORGANISM = config['organism']
+
+# FASTQ file extension used to detect input files.
+EXT = str(custom_param('ext', 'fastq.gz'))
+
+RAW_FASTQ_DIR = config["paths"]["raw_fastq"]
+OUT_ROOT      = config["paths"]["out_root"]
+LOG_ROOT = config["paths"]["log_root"]
+QC_ROOT = os.path.join(OUT_ROOT, "Quality_Control")
+
+
+spikeIN = str(config["spikeIN"]).strip().lower()
+if spikeIN not in ["yes", "no"]:
+    raise ValueError("ERROR: spikeIN must be either 'yes' or 'no'.")
+ALIGNER = str(config["aligner"]).strip().lower()
+if ALIGNER not in ["star", "bowtie2"]:
+    raise ValueError("ERROR: aligner must be either 'star' or 'bowtie2'.")
+ALIGN_DIR = f"{ALIGNER}_spike_in" if spikeIN == "yes" else ALIGNER
+MAIN_BAM_DIR = os.path.join(OUT_ROOT, "split_bam", "main") if spikeIN == "yes" else os.path.join(OUT_ROOT, ALIGN_DIR)
+
+# ------------------------------------------------------------------------------
+# Sample discovery and selection
+# ------------------------------------------------------------------------------
+# All samples are detected from the raw FASTQ directory. If select_samples is
+# provided in the configuration file, the workflow is restricted to that subset.
+
+ALL_SAMPLES = sorted(get_samples(RAW_FASTQ_DIR, EXT))
+
+SELECT_SAMPLES = config.get("select_samples", [])
+
+if SELECT_SAMPLES is None:
+    SELECT_SAMPLES = []
+
+SELECT_SAMPLES = [str(s).strip() for s in SELECT_SAMPLES if str(s).strip() != ""]
+
+if len(SELECT_SAMPLES) == 0:
+    SAMPLES = ALL_SAMPLES
+else:
+    missing_samples = sorted(set(SELECT_SAMPLES) - set(ALL_SAMPLES))
+
+    if len(missing_samples) > 0:
+        raise ValueError(
+            "ERROR: some selected samples were not found under RAW_FASTQ_DIR:\n"
+            f"{missing_samples}\n"
+            f"Available samples are:\n{ALL_SAMPLES}"
+        )
+
+    SAMPLES = sorted(SELECT_SAMPLES)
+
+if len(SAMPLES) == 0:
+    raise ValueError(
+        f"ERROR: no samples found under RAW_FASTQ_DIR={RAW_FASTQ_DIR} with extension {EXT}"
+    )
+
+print("Available samples:", ALL_SAMPLES)
+print("Selected samples:", SAMPLES)
+
+# ------------------------------------------------------------------------------
+# Peak calling metadata and target groups
+# ------------------------------------------------------------------------------
+# When peak calling is enabled, the metadata table is loaded and validated here.
+# This block defines which IP samples require narrow and/or broad peak calling,
+# as well as the consensus and union peak groups used by downstream rules.
+
+calling_peaks = str(config["calling_peaks"]).strip().lower()
+
+if calling_peaks not in ["yes", "no"]:
+    raise ValueError("ERROR: calling_peaks must be either 'yes' or 'no'.")
+
+if calling_peaks == "yes":
+
+    METADATA = pd.read_csv(config["metadata"], sep="\t").fillna("")
+
+    required_cols = ["sample", "role", "condition", "mark", "replicate", "control", "peak_type"]
+
+    for col in required_cols:
+        if col not in METADATA.columns:
+            raise ValueError(f"ERROR: metadata file is missing required column: {col}")
+
+    METADATA["sample"] = METADATA["sample"].astype(str).str.strip()
+    METADATA["role"] = METADATA["role"].astype(str).str.strip().str.upper()
+    METADATA["condition"] = METADATA["condition"].astype(str).str.strip()
+    METADATA["mark"] = METADATA["mark"].astype(str).str.strip()
+    METADATA["control"] = METADATA["control"].astype(str).str.strip()
+    METADATA["peak_type"] = METADATA["peak_type"].astype(str).str.strip().str.lower()
+
+    for sample in METADATA["sample"]:
+        if sample not in SAMPLES:
+            raise ValueError(f"ERROR: sample '{sample}' is present in metadata but not in SAMPLES/config.")
+
+    valid_roles = ["IP", "INPUT"]
+
+    for _, row in METADATA.iterrows():
+        if row["role"] not in valid_roles:
+            raise ValueError(f"ERROR: sample '{row['sample']}' has invalid role: {row['role']}")
+
+    valid_peak_types = ["narrow", "broad", "both"]
+
+    for _, row in METADATA.loc[METADATA["role"] == "IP"].iterrows():
+        if row["peak_type"] not in valid_peak_types:
+            raise ValueError(f"ERROR: IP sample '{row['sample']}' has invalid peak_type: {row['peak_type']}")
+
+    for _, row in METADATA.loc[METADATA["role"] == "INPUT"].iterrows():
+        if row["peak_type"] != "none":
+            raise ValueError(f"ERROR: Input sample '{row['sample']}' should have peak_type = none.")
+
+    for _, row in METADATA.loc[METADATA["role"] == "IP"].iterrows():
+        control = row["control"]
+
+        if control != "" and control not in METADATA["sample"].tolist():
+            raise ValueError(f"ERROR: control '{control}' for sample '{row['sample']}' is not present in metadata.")
+
+        if control != "":
+            control_role = METADATA.loc[METADATA["sample"] == control, "role"].iloc[0]
+
+            if control_role != "INPUT":
+                raise ValueError(
+                    f"ERROR: control '{control}' for sample '{row['sample']}' is not annotated as INPUT."
+                )
+
+    NARROW_SAMPLES = METADATA.loc[
+        (METADATA["role"] == "IP") & (METADATA["peak_type"].isin(["narrow", "both"])),
+        "sample"
+    ].tolist()
+
+    BROAD_SAMPLES = METADATA.loc[
+        (METADATA["role"] == "IP") & (METADATA["peak_type"].isin(["broad", "both"])),
+        "sample"
+    ].tolist()
+
+    # MACS3 input format depends on the sequencing layout.
+    MACS_FORMAT = "BAMPE" if LAYOUT == "PAIRED" else "BAM"
+
+    # Consensus peak groups are defined by condition, mark and peak mode.
+    CONSENSUS_GROUPS = []
+
+    for peak_mode in ["narrow", "broad"]:
+        group_metadata = METADATA.loc[
+            (METADATA["role"] == "IP") &
+            (METADATA["peak_type"].isin([peak_mode, "both"]))
+        ]
+
+        for _, row in group_metadata[["condition", "mark"]].drop_duplicates().iterrows():
+            CONSENSUS_GROUPS.append({
+                "peak_mode": peak_mode,
+                "condition": row["condition"],
+                "mark": row["mark"]
+            })
+
+    CONSENSUS_PEAK_MODES = [g["peak_mode"] for g in CONSENSUS_GROUPS]
+    CONSENSUS_CONDITIONS = [g["condition"] for g in CONSENSUS_GROUPS]
+    CONSENSUS_MARKS = [g["mark"] for g in CONSENSUS_GROUPS]
+
+    # Union peak groups are defined by mark and peak mode.
+    UNION_GROUPS = []
+
+    for peak_mode in ["narrow", "broad"]:
+        group_metadata = METADATA.loc[
+            (METADATA["role"] == "IP") &
+            (METADATA["peak_type"].isin([peak_mode, "both"]))
+        ]
+
+        for mark in group_metadata["mark"].drop_duplicates().tolist():
+            UNION_GROUPS.append({
+                "peak_mode": peak_mode,
+                "mark": mark
+            })
+
+    UNION_PEAK_MODES = [g["peak_mode"] for g in UNION_GROUPS]
+    UNION_MARKS = [g["mark"] for g in UNION_GROUPS]
+
+# ------------------------------------------------------------------------------
+# Peak calling helper functions
+# ------------------------------------------------------------------------------
+# These functions dynamically provide rule inputs based on the metadata table.
+# They are defined only when peak calling is enabled.
+
+if calling_peaks == "yes":
+
+    def get_control_bam(wc):
+        """
+        Return the input/control BAM associated with an IP sample, if available.
+        """
+        control = METADATA.loc[METADATA["sample"] == wc.sample, "control"].iloc[0]
+
+        if control == "":
+            return []
+
+        return os.path.join(MAIN_BAM_DIR, f"{control}.bam")
+
+    def get_peaks_for_consensus(wc):
+        """
+        Return per-sample MACS3 peak files belonging to a consensus peak group.
+        """
+        samples = METADATA.loc[
+            (METADATA["role"] == "IP") &
+            (METADATA["condition"] == wc.condition) &
+            (METADATA["mark"] == wc.mark) &
+            (METADATA["peak_type"].isin([wc.peak_mode, "both"])),
+            "sample"
+        ].tolist()
+
+        if len(samples) == 0:
+            raise ValueError(
+                f"ERROR: no samples found for consensus group: "
+                f"condition={wc.condition}, mark={wc.mark}, peak_mode={wc.peak_mode}"
+            )
+
+        return [
+            os.path.join(OUT_ROOT, "peaks", "macs3", wc.peak_mode, sample, f"{sample}_peaks.{wc.peak_mode}Peak")
+            for sample in samples
+        ]
+
+    def get_consensus_for_sample(wc):
+        """
+        Return the consensus peak file corresponding to a given sample and peak mode.
+        """
+        condition = METADATA.loc[METADATA["sample"] == wc.sample, "condition"].iloc[0]
+        mark = METADATA.loc[METADATA["sample"] == wc.sample, "mark"].iloc[0]
+
+        return os.path.join(
+            OUT_ROOT,
+            "peaks",
+            "consensus",
+            wc.peak_mode,
+            mark,
+            f"{condition}.{mark}.{wc.peak_mode}.consensus.bed"
+        )
+
+    def get_consensus_peaks_for_union(wc):
+        """
+        Return condition-level consensus peak files used to build a union peak set.
+        """
+        conditions = METADATA.loc[
+            (METADATA["role"] == "IP") &
+            (METADATA["mark"] == wc.mark) &
+            (METADATA["peak_type"].isin([wc.peak_mode, "both"])),
+            "condition"
+        ].drop_duplicates().tolist()
+
+        if len(conditions) == 0:
+            raise ValueError(
+                f"ERROR: no consensus peak groups found for union: "
+                f"mark={wc.mark}, peak_mode={wc.peak_mode}"
+            )
+
+        return [
+            os.path.join(
+                OUT_ROOT,
+                "peaks",
+                "consensus",
+                wc.peak_mode,
+                wc.mark,
+                f"{condition}.{wc.mark}.{wc.peak_mode}.consensus.bed"
+            )
+            for condition in conditions
+        ]
+
+    def get_samples_for_union_counts(wc):
+        """
+        Return IP samples included in the peak count matrix for a mark and peak mode.
+        """
+        samples = METADATA.loc[
+            (METADATA["role"] == "IP") &
+            (METADATA["mark"] == wc.mark) &
+            (METADATA["peak_type"].isin([wc.peak_mode, "both"])),
+            "sample"
+        ].tolist()
+
+        if len(samples) == 0:
+            raise ValueError(
+                f"ERROR: no IP samples found for count matrix: "
+                f"mark={wc.mark}, peak_mode={wc.peak_mode}"
+            )
+
+        return samples
+
+# ------------------------------------------------------------------------------
+# MultiQC input collection
+# ------------------------------------------------------------------------------
+# MultiQC is forced to run at the end of the workflow by collecting the expected
+# QC files from all enabled modules as explicit inputs.
+
+MULTIQC_INPUTS = []
+
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "fastq", "raw_fastqc", "{sample}"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "fastq", "trimmed_fastqc", "{sample}"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "alignment", "samtools_flagstat", "{sample}.flagstat.txt"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "alignment", "samtools_stats", "{sample}.stats.txt"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "alignment", "samtools_idxstats", "{sample}.idxstats.txt"), sample=SAMPLES)
+
+if spikeIN == "yes":
+    MULTIQC_INPUTS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment", "combined",
+            "{sample}.combined.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+    MULTIQC_INPUTS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment", "main",
+            "{sample}.main.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+else:
+    MULTIQC_INPUTS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment",
+            "{sample}.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "duplicates", "picard_markduplicates", "{sample}.marked_dup_metrics.txt"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "blacklist", "{sample}.blacklist_fraction.tsv"), sample=SAMPLES)
+MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "enrichment", "cross_correlation", "{sample}.spp.out"), sample=SAMPLES)
+MULTIQC_INPUTS += [os.path.join(QC_ROOT, "enrichment", "fingerprint", f"{config['GSE']}.plotFingerprint.raw_counts.tsv")]
+
+if LAYOUT == "PAIRED":
+    MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "insert_size", "{sample}.insert_size_metrics.txt"), sample=SAMPLES)
+
+if calling_peaks == "yes":
+    MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "peaks", "frip", "individual", "{sample}.narrow.frip.tsv"), sample=NARROW_SAMPLES)
+    MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "peaks", "frip", "individual", "{sample}.broad.frip.tsv"), sample=BROAD_SAMPLES)
+    MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "peaks", "frip", "consensus", "{sample}.narrow.consensus_frip.tsv"), sample=NARROW_SAMPLES)
+    MULTIQC_INPUTS += expand(os.path.join(QC_ROOT, "peaks", "frip", "consensus", "{sample}.broad.consensus_frip.tsv"), sample=BROAD_SAMPLES)
+    MULTIQC_INPUTS += expand(
+        os.path.join(OUT_ROOT, "peaks", "counts", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.featureCounts.raw.tsv.summary"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+# ------------------------------------------------------------------------------
+# Final workflow targets
+# ------------------------------------------------------------------------------
+# ALL_TARGETS defines the complete set of files expected from a successful
+# pipeline run. Targets are added conditionally depending on the sequencing
+# layout, spike-in configuration and peak calling settings.
+
+ALL_TARGETS = []
+
+# ------------------------------------------------------------------------------
+# Read-level QC and trimming outputs
+# ------------------------------------------------------------------------------
+# Raw and trimmed FastQC reports are collected together with the trimmed FASTQ
+# files generated by Trim Galore.
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "fastq", "raw_fastqc", "{sample}"),
+    sample=SAMPLES
+)
+
+if LAYOUT == "PAIRED":
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_val_1.fq.gz"),
+        sample=SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_val_2.fq.gz"),
+        sample=SAMPLES
+    )
+else:
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_trimmed.fq.gz"),
+        sample=SAMPLES
+    )
+
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "fastq", "trimmed_fastqc", "{sample}"),
+    sample=SAMPLES
+)
+
+# ------------------------------------------------------------------------------
+# Final processed BAM files
+# ------------------------------------------------------------------------------
+# Final coordinate-sorted BAM files and their indexes are required as core outputs
+# of the main processing workflow.
+
+ALL_TARGETS += expand(os.path.join(OUT_ROOT, ALIGN_DIR, "{sample}.bam"), sample=SAMPLES)
+ALL_TARGETS += expand(os.path.join(OUT_ROOT, ALIGN_DIR, "{sample}.bam.bai"), sample=SAMPLES)
+
+# ------------------------------------------------------------------------------
+# Alignment and library QC outputs
+# ------------------------------------------------------------------------------
+# samtools and Picard metrics summarize mapping quality, alignment statistics,
+# duplicate rates and insert-size distributions.
+
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "duplicates", "picard_markduplicates", "{sample}.marked_dup_metrics.txt"), sample=SAMPLES)
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "alignment", "samtools_flagstat", "{sample}.flagstat.txt"), sample=SAMPLES)
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "alignment", "samtools_stats", "{sample}.stats.txt"), sample=SAMPLES)
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "alignment", "samtools_idxstats", "{sample}.idxstats.txt"), sample=SAMPLES)
+
+# For spike-in datasets, Picard alignment metrics are collected both before and
+# after splitting the combined BAM into main-organism and spike-in reads.
+if spikeIN == "yes":
+    ALL_TARGETS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment", "combined",
+            "{sample}.combined.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment", "main",
+            "{sample}.main.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+else:
+    ALL_TARGETS += expand(
+        os.path.join(
+            QC_ROOT, "alignment", "picard_alignment",
+            "{sample}.alignment_summary_metrics.txt"
+        ),
+        sample=SAMPLES
+    )
+
+# Insert-size metrics are only generated for paired-end libraries.
+if LAYOUT == "PAIRED":
+    ALL_TARGETS += expand(os.path.join(QC_ROOT, "insert_size", "{sample}.insert_size_metrics.txt"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(QC_ROOT, "insert_size", "{sample}.insert_size_histogram.pdf"), sample=SAMPLES)
+
+# ------------------------------------------------------------------------------
+# ChIP enrichment and artifact QC outputs
+# ------------------------------------------------------------------------------
+# Cross-correlation, blacklist fraction and fingerprint plots are used to assess
+# ChIP enrichment, library complexity and potential technical artifacts.
+
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "enrichment", "cross_correlation", "{sample}.spp.out"), sample=SAMPLES)
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "enrichment", "cross_correlation", "{sample}.cross_correlation.pdf"), sample=SAMPLES)
+
+ALL_TARGETS += expand(os.path.join(QC_ROOT, "blacklist", "{sample}.blacklist_fraction.tsv"), sample=SAMPLES)
+
+ALL_TARGETS += [
+    os.path.join(QC_ROOT, "enrichment", "fingerprint", f"{config['GSE']}.plotFingerprint.pdf"),
+    os.path.join(QC_ROOT, "enrichment", "fingerprint", f"{config['GSE']}.plotFingerprint.raw_counts.tsv")
+]
+
+
+# ------------------------------------------------------------------------------
+# BAM-level reproducibility outputs
+# ------------------------------------------------------------------------------
+# multiBamSummary matrices are used to generate sample correlation and PCA plots
+# before coverage-track normalization.
+
+ALL_TARGETS += [
+    os.path.join(OUT_ROOT, "multiBamSummary", f"{config['GSE']}_multiBamSummary.npz"),
+    os.path.join(OUT_ROOT, "multiBamSummary", f"{config['GSE']}_multiBamSummary.txt"),
+    os.path.join(QC_ROOT, "reproducibility", "correlation", f"{config['GSE']}.multiBamSummary.spearman_heatmap.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "correlation", f"{config['GSE']}.multiBamSummary.spearman_matrix.tab"),
+    os.path.join(QC_ROOT, "reproducibility", "PCA", f"{config['GSE']}.multiBamSummary.PCA.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "PCA", f"{config['GSE']}.multiBamSummary.PCA.tab")
+]
+
+
+# ------------------------------------------------------------------------------
+# Spike-in-normalized workflow outputs
+# ------------------------------------------------------------------------------
+# When spike-in normalization is enabled, the combined BAM is split into
+# main-organism and spike-in BAMs. Spike-in read counts are then used to generate
+# normalized bigWig tracks and normalized-signal reproducibility QC.
+
+if spikeIN == "yes":
+
+    # Split BAM files and genome-specific idxstats reports
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/main", "{sample}.bam"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/main", "{sample}.bam.bai"), sample=SAMPLES)
+
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/spikein", "{sample}.spikein.bam"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/spikein", "{sample}.spikein.bam.bai"), sample=SAMPLES)
+
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/idxstats", "{sample}.combined.idxstats.txt"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/idxstats", "{sample}.main.prerename.idxstats.txt"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/idxstats", "{sample}.main.postrename.idxstats.txt"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "split_bam/idxstats", "{sample}.spikein.idxstats.txt"), sample=SAMPLES)
+
+    # Spike-in read counts and normalization factors
+    ALL_TARGETS += [
+        os.path.join(OUT_ROOT, "spikein_counts", "spike_reads_table.tsv"),
+        os.path.join(OUT_ROOT, "spikein_counts", "scale_factors.tsv")
+    ]
+
+    # Spike-in-normalized bigWig tracks
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "bigwig_spikein_median", "{sample}.coverage.spikein_median.bw"), sample=SAMPLES)
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "bigwig_spikein_deseq2", "{sample}.coverage.spikein_deseq2.bw"), sample=SAMPLES)
+
+    # Summary matrices from spike-in-normalized bigWigs
+    ALL_TARGETS += [
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.spikein_median.npz"),
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.spikein_median.txt"),
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.spikein_deseq2.npz"),
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.spikein_deseq2.txt")
+    ]
+
+    # Normalized-signal correlation and PCA plots
+    ALL_TARGETS += [
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_median", "correlation", f"{config['GSE']}.spikein_median.spearman_heatmap.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_median", "correlation", f"{config['GSE']}.spikein_median.spearman_matrix.tab"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_median", "PCA", f"{config['GSE']}.spikein_median.PCA.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_median", "PCA", f"{config['GSE']}.spikein_median.PCA.tab"),
+
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_deseq2", "correlation", f"{config['GSE']}.spikein_deseq2.spearman_heatmap.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_deseq2", "correlation", f"{config['GSE']}.spikein_deseq2.spearman_matrix.tab"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_deseq2", "PCA", f"{config['GSE']}.spikein_deseq2.PCA.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "spikein_deseq2", "PCA", f"{config['GSE']}.spikein_deseq2.PCA.tab")
+    ]
+
+else:
+    # CPM-normalized workflow outputs are generated when spike-in normalization is not enabled.
+
+    # CPM-normalized bigWig tracks
+    ALL_TARGETS += expand(os.path.join(OUT_ROOT, "bigwig", "{sample}.coverage.bw"), sample=SAMPLES)
+
+    # Summary matrices from CPM-normalized bigWigs
+    ALL_TARGETS += [
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.npz"),
+        os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary.txt")
+    ]
+
+    # Normalized-signal correlation and PCA plots
+    ALL_TARGETS += [
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "CPM", "correlation", f"{config['GSE']}.CPM.spearman_heatmap.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "CPM", "correlation", f"{config['GSE']}.CPM.spearman_matrix.tab"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "CPM", "PCA", f"{config['GSE']}.CPM.PCA.pdf"),
+        os.path.join(QC_ROOT, "reproducibility", "normalized_signal", "CPM", "PCA", f"{config['GSE']}.CPM.PCA.tab")
+    ]
+
+
+# ------------------------------------------------------------------------------
+# Peak calling and peak-level analysis outputs
+# ------------------------------------------------------------------------------
+# When enabled, this block collects the final outputs generated by the peak calling
+# module: per-sample MACS3 peaks, consensus and union peak sets, count matrices,
+# FRiP metrics, peak-level QC summaries and signal heatmaps.
+
+if calling_peaks == "yes":
+
+    # Per-sample MACS3 peak calls
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "macs3", "narrow", "{sample}", "{sample}_peaks.narrowPeak"),
+        sample=NARROW_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "macs3", "broad", "{sample}", "{sample}_peaks.broadPeak"),
+        sample=BROAD_SAMPLES
+    )
+
+    # Condition-level consensus peak sets
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "consensus", "{peak_mode}", "{mark}", "{condition}.{mark}.{peak_mode}.consensus.bed"),
+        zip,
+        peak_mode=CONSENSUS_PEAK_MODES,
+        mark=CONSENSUS_MARKS,
+        condition=CONSENSUS_CONDITIONS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "consensus", "{peak_mode}", "{mark}", "{condition}.{mark}.{peak_mode}.multiinter.bed"),
+        zip,
+        peak_mode=CONSENSUS_PEAK_MODES,
+        mark=CONSENSUS_MARKS,
+        condition=CONSENSUS_CONDITIONS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "consensus", "{condition}.{mark}.{peak_mode}.consensus.summary.tsv"),
+        zip,
+        condition=CONSENSUS_CONDITIONS,
+        mark=CONSENSUS_MARKS,
+        peak_mode=CONSENSUS_PEAK_MODES
+    )
+
+    # Mark-level union peak sets
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "union", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.union_peaks.bed"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "union", "{mark}.{peak_mode}.union_peaks.summary.tsv"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    # Peak count matrices over union peak sets
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "counts", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.union_peaks.saf"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "counts", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.featureCounts.raw.tsv"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "counts", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.featureCounts.raw.tsv.summary"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "peaks", "counts", "{peak_mode}", "{mark}", "{mark}.{peak_mode}.counts_matrix.tsv"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "counts", "{mark}.{peak_mode}.counts.summary.tsv"),
+        zip,
+        peak_mode=UNION_PEAK_MODES,
+        mark=UNION_MARKS
+    )
+
+    # Peak-level QC summaries
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "individual", "{sample}.narrow.peak_qc.tsv"),
+        sample=NARROW_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "individual", "{sample}.broad.peak_qc.tsv"),
+        sample=BROAD_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "consensus", "{condition}.{mark}.{peak_mode}.peak_qc.tsv"),
+        zip,
+        condition=CONSENSUS_CONDITIONS,
+        mark=CONSENSUS_MARKS,
+        peak_mode=CONSENSUS_PEAK_MODES
+    )
+
+    # FRiP metrics
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "frip", "individual", "{sample}.narrow.frip.tsv"),
+        sample=NARROW_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "frip", "individual", "{sample}.broad.frip.tsv"),
+        sample=BROAD_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "frip", "consensus", "{sample}.narrow.consensus_frip.tsv"),
+        sample=NARROW_SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(QC_ROOT, "peaks", "frip", "consensus", "{sample}.broad.consensus_frip.tsv"),
+        sample=BROAD_SAMPLES
+    )
+
+    # Signal heatmaps over union peaks
+    # Heatmap inputs depend on the normalization strategy used to generate bigWigs.
+    if spikeIN == "yes":
+
+        ALL_TARGETS += expand(
+            os.path.join(QC_ROOT, "peaks", "signal_heatmap", "spikein_median", "{peak_mode}", "{mark}.{peak_mode}.heatmap.pdf"),
+            zip,
+            peak_mode=UNION_PEAK_MODES,
+            mark=UNION_MARKS
+        )
+
+        ALL_TARGETS += expand(
+            os.path.join(QC_ROOT, "peaks", "signal_heatmap", "spikein_deseq2", "{peak_mode}", "{mark}.{peak_mode}.heatmap.pdf"),
+            zip,
+            peak_mode=UNION_PEAK_MODES,
+            mark=UNION_MARKS
+        )
+
+    else:
+
+        ALL_TARGETS += expand(
+            os.path.join(QC_ROOT, "peaks", "signal_heatmap", "CPM", "{peak_mode}", "{mark}.{peak_mode}.heatmap.pdf"),
+            zip,
+            peak_mode=UNION_PEAK_MODES,
+            mark=UNION_MARKS
+        )
+
+# ------------------------------------------------------------------------------
+# Final MultiQC report
+# ------------------------------------------------------------------------------
+# MultiQC integrates the QC outputs generated across the enabled workflow modules.
+
+ALL_TARGETS += [
+    os.path.join(QC_ROOT, "multiqc", f"{config['GSE']}_multiqc_report.html")
+]
+
+rule all:
+    input:
+        ALL_TARGETS
+
+# ------------------------------------------------------------------------------
+# Workflow modules
+# ------------------------------------------------------------------------------
+# Rule definitions are kept in separate modules to make the pipeline easier to
+# maintain and extend.
+
+include: "workflow/main_workflow.smk"
+include: "workflow/main_qc.smk"
+include: "workflow/peak_calling.smk"

@@ -1,0 +1,365 @@
+# ==============================================================================
+# Bulk RNA-seq Snakemake workflow
+# ==============================================================================
+# This Snakefile defines the global configuration, sample discovery logic,
+# final workflow targets and module imports for the bulk RNA-seq pipeline.
+#
+# The actual processing and quality control rules are implemented in separate
+# workflow modules:
+#   - workflow/workflow_RNAseq.smk
+#   - workflow/qc_RNAseqc.smk
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Imports
+# ------------------------------------------------------------------------------
+
+import glob
+import os
+
+# ------------------------------------------------------------------------------
+# Project-level paths
+# ------------------------------------------------------------------------------
+
+# Root directory from which the workflow is executed.
+PROJECT_DIR = os.getcwd()
+
+# Directory containing Conda environment YAML files.
+ENV_DIR = os.path.join(PROJECT_DIR, "envs")
+
+# Directory containing custom helper scripts used by the workflow.
+SCRIPT_DIR = os.path.join(PROJECT_DIR, "scripts")
+
+# ------------------------------------------------------------------------------
+# Configuration file
+# ------------------------------------------------------------------------------
+
+configfile: "config/config_RNAseq.yaml"
+
+# ------------------------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------------------------
+# These functions are used to discover input samples, resolve FASTQ paths and
+# retrieve optional user-defined resource parameters from the configuration file.
+
+def get_samples(path, file_ext):
+    """
+    Detect sample names from raw FASTQ files.
+
+    For paired-end data, both common naming conventions are supported:
+    *_R1_001 / *_R2_001 and *_R1 / *_R2.
+    For single-end data, the sample name is inferred directly from the FASTQ
+    filename by removing the configured extension.
+    """
+
+    files = glob.glob(os.path.join(path, f"**/*.{file_ext}"), recursive=True)
+    samples = set()
+
+    if LAYOUT == "PAIRED":
+        for f in files:
+            bn = os.path.basename(f)
+
+            if bn.endswith(f"_R1_001.{file_ext}"):
+                samples.add(bn.replace(f"_R1_001.{file_ext}", ""))
+            elif bn.endswith(f"_R2_001.{file_ext}"):
+                samples.add(bn.replace(f"_R2_001.{file_ext}", ""))
+
+            elif bn.endswith(f"_R1.{file_ext}"):
+                samples.add(bn.replace(f"_R1.{file_ext}", ""))
+            elif bn.endswith(f"_R2.{file_ext}"):
+                samples.add(bn.replace(f"_R2.{file_ext}", ""))
+
+    else:
+        for f in files:
+            bn = os.path.basename(f)
+            samples.add(bn.replace(f".{file_ext}", ""))
+
+    return samples
+
+
+def get_raw_reads(wcs):
+    """
+    Return the raw FASTQ file(s) associated with a sample wildcard.
+
+    The function searches recursively under RAW_FASTQ_DIR and raises an error if
+    no matching FASTQ files are found or if multiple valid matches are detected.
+    """
+
+    if LAYOUT == "PAIRED":
+        patterns = [
+            (
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R1_001.{EXT}"),
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R2_001.{EXT}")
+            ),
+            (
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R1.{EXT}"),
+                os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}_R2.{EXT}")
+            )
+        ]
+
+        matches = []
+
+        for r1_pattern, r2_pattern in patterns:
+            r1_matches = sorted(glob.glob(r1_pattern, recursive=True))
+            r2_matches = sorted(glob.glob(r2_pattern, recursive=True))
+
+            if len(r1_matches) == 1 and len(r2_matches) == 1:
+                matches.append((r1_matches[0], r2_matches[0]))
+
+            elif len(r1_matches) > 1 or len(r2_matches) > 1:
+                raise ValueError(
+                    f"ERROR: multiple FASTQ files found for sample={wcs.sample}\n"
+                    f"R1 matches: {r1_matches}\n"
+                    f"R2 matches: {r2_matches}\n"
+                    f"Please make RAW_FASTQ_DIR more specific or remove duplicate files."
+                )
+
+        if len(matches) == 1:
+            return list(matches[0])
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"ERROR: multiple valid paired FASTQ naming patterns found for sample={wcs.sample}: {matches}\n"
+                f"Please keep only one naming convention: either _R1_001/_R2_001 or _R1/_R2."
+            )
+
+        raise FileNotFoundError(
+            f"ERROR: paired FASTQ files not found for sample={wcs.sample} under {RAW_FASTQ_DIR}"
+        )
+
+    elif LAYOUT == "SINGLE":
+        pattern = os.path.join(RAW_FASTQ_DIR, "**", f"{wcs.sample}.{EXT}")
+        matches = sorted(glob.glob(pattern, recursive=True))
+
+        if len(matches) == 1:
+            return matches[0]
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"ERROR: multiple FASTQ files found for sample={wcs.sample}\n"
+                f"Matches: {matches}\n"
+                f"Please make RAW_FASTQ_DIR more specific or remove duplicate files."
+            )
+
+        raise FileNotFoundError(
+            f"ERROR: single-end FASTQ file not found for sample={wcs.sample} under {RAW_FASTQ_DIR}"
+        )
+
+
+def custom_param(param, default):
+    """
+    Return a user-defined configuration parameter or a rule-level default value.
+
+    This allows selected runtime resources to be overridden in the config file
+    without requiring every parameter to be explicitly defined.
+    """
+
+    try:
+        return config[param]
+
+    except KeyError:
+        return default
+
+# ------------------------------------------------------------------------------
+# Global configuration variables
+# ------------------------------------------------------------------------------
+# Core configuration values are normalized here and reused across workflow modules.
+
+LAYOUT = str(config["layout"]).strip().upper()
+if LAYOUT not in ["PAIRED", "SINGLE"]:
+    raise ValueError("ERROR: layout must be either 'PAIRED' or 'SINGLE'.")
+ORGANISM = config['organism']
+
+# FASTQ file extension used to detect input files.
+EXT = str(custom_param('ext', 'fastq.gz'))
+
+RAW_FASTQ_DIR = config["paths"]["raw_fastq"]
+OUT_ROOT      = config["paths"]["out_root"]
+LOG_ROOT = config["paths"]["log_root"]
+QC_ROOT = os.path.join(OUT_ROOT, "Quality_Control")
+
+# Directory name used for STAR alignment outputs.
+# The variable is kept explicit so additional aligners could be added in future
+# versions without changing downstream rule paths.
+ALIGN_DIR = "star"
+
+# Normalization method used to generate bigWig coverage tracks.
+# The value is also included in output filenames to avoid ambiguity when comparing
+# CPM, RPKM, BPM or other deepTools-supported normalization methods.
+BW_NORMALIZATION = str(custom_param("bamcoverage_normalization", "CPM")).strip().upper()
+
+# ------------------------------------------------------------------------------
+# Sample discovery and selection
+# ------------------------------------------------------------------------------
+# All samples are detected from the raw FASTQ directory. If select_samples is
+# provided in the configuration file, the workflow is restricted to that subset.
+
+ALL_SAMPLES = sorted(get_samples(RAW_FASTQ_DIR, EXT))
+
+SELECT_SAMPLES = config.get("select_samples", [])
+
+if SELECT_SAMPLES is None:
+    SELECT_SAMPLES = []
+
+SELECT_SAMPLES = [str(s).strip() for s in SELECT_SAMPLES if str(s).strip() != ""]
+
+if len(SELECT_SAMPLES) == 0:
+    SAMPLES = ALL_SAMPLES
+else:
+    missing_samples = sorted(set(SELECT_SAMPLES) - set(ALL_SAMPLES))
+
+    if len(missing_samples) > 0:
+        raise ValueError(
+            "ERROR: some selected samples were not found under RAW_FASTQ_DIR:\n"
+            f"{missing_samples}\n"
+            f"Available samples are:\n{ALL_SAMPLES}"
+        )
+
+    SAMPLES = sorted(SELECT_SAMPLES)
+
+if len(SAMPLES) == 0:
+    raise ValueError(
+        f"ERROR: no samples found under RAW_FASTQ_DIR={RAW_FASTQ_DIR} with extension {EXT}"
+    )
+
+print("Available samples:", ALL_SAMPLES)
+print("Selected samples:", SAMPLES)
+
+# ------------------------------------------------------------------------------
+# Final workflow targets
+# ------------------------------------------------------------------------------
+# ALL_TARGETS defines the complete set of files expected from a successful
+# bulk RNA-seq pipeline run.
+
+ALL_TARGETS = []
+
+# ------------------------------------------------------------------------------
+# Read-level QC and trimming outputs
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "fastqc", "raw", "{sample}"),
+    sample=SAMPLES
+)
+
+if LAYOUT == "PAIRED":
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_val_1.fq.gz"),
+        sample=SAMPLES
+    )
+
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_val_2.fq.gz"),
+        sample=SAMPLES
+    )
+
+else:
+    ALL_TARGETS += expand(
+        os.path.join(OUT_ROOT, "fastq_trimmed", "{sample}_trimmed.fq.gz"),
+        sample=SAMPLES
+    )
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "fastqc", "trimmed", "{sample}"),
+    sample=SAMPLES
+)
+
+# ------------------------------------------------------------------------------
+# Final processed BAM files
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += expand(
+    os.path.join(OUT_ROOT, ALIGN_DIR, "{sample}.bam"),
+    sample=SAMPLES
+)
+
+ALL_TARGETS += expand(
+    os.path.join(OUT_ROOT, ALIGN_DIR, "{sample}.bam.bai"),
+    sample=SAMPLES
+)
+
+# ------------------------------------------------------------------------------
+# Gene-level count matrices
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += [
+    os.path.join(OUT_ROOT, "counts", "exon", "featureCounts_exon.txt"),
+    os.path.join(OUT_ROOT, "counts", "exon", "featureCounts_exon.txt.summary"),
+    os.path.join(OUT_ROOT, "counts", "gene_body", "featureCounts_gene_body.txt"),
+    os.path.join(OUT_ROOT, "counts", "gene_body", "featureCounts_gene_body.txt.summary")
+]
+
+# ------------------------------------------------------------------------------
+# Genome-wide coverage tracks
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += expand(
+    os.path.join(OUT_ROOT, "bigwig", "{sample}." + BW_NORMALIZATION + ".bw"),
+    sample=SAMPLES
+)
+
+# ------------------------------------------------------------------------------
+# BAM-level reproducibility outputs
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += [
+    os.path.join(OUT_ROOT, "multiBamSummary", f"{config['GSE']}_multiBamSummary.npz"),
+    os.path.join(OUT_ROOT, "multiBamSummary", f"{config['GSE']}_multiBamSummary.txt"),
+    os.path.join(QC_ROOT, "reproducibility", "correlation", f"{config['GSE']}.multiBamSummary.spearman_heatmap.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "correlation", f"{config['GSE']}.multiBamSummary.spearman_matrix.tab"),
+    os.path.join(QC_ROOT, "reproducibility", "PCA", f"{config['GSE']}.multiBamSummary.PCA.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "PCA", f"{config['GSE']}.multiBamSummary.PCA.tab")
+]
+
+# ------------------------------------------------------------------------------
+# bigWig-level reproducibility outputs
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += [
+    os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary_{BW_NORMALIZATION}.npz"),
+    os.path.join(OUT_ROOT, "multiBigwigSummary", f"{config['GSE']}_multiBigwigSummary_{BW_NORMALIZATION}.txt"),
+    os.path.join(QC_ROOT, "reproducibility", "normalized_signal", BW_NORMALIZATION, "correlation", f"{config['GSE']}.{BW_NORMALIZATION}.spearman_heatmap.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "normalized_signal", BW_NORMALIZATION, "correlation", f"{config['GSE']}.{BW_NORMALIZATION}.spearman_matrix.tab"),
+    os.path.join(QC_ROOT, "reproducibility", "normalized_signal", BW_NORMALIZATION, "PCA", f"{config['GSE']}.{BW_NORMALIZATION}.PCA.pdf"),
+    os.path.join(QC_ROOT, "reproducibility", "normalized_signal", BW_NORMALIZATION, "PCA", f"{config['GSE']}.{BW_NORMALIZATION}.PCA.tab")
+]
+
+# ------------------------------------------------------------------------------
+# Alignment QC outputs
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "alignment", "samtools", "{sample}.flagstat.txt"),
+    sample=SAMPLES
+)
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "alignment", "samtools", "{sample}.idxstats.txt"),
+    sample=SAMPLES
+)
+
+ALL_TARGETS += expand(
+    os.path.join(QC_ROOT, "alignment", "samtools", "{sample}.stats.txt"),
+    sample=SAMPLES
+)
+
+# ------------------------------------------------------------------------------
+# Final MultiQC report
+# ------------------------------------------------------------------------------
+
+ALL_TARGETS += [
+    os.path.join(OUT_ROOT, "multiqc", f"{config['GSE']}_multiqc_report.html")
+]
+
+rule all:
+    input:
+        ALL_TARGETS
+
+# ------------------------------------------------------------------------------
+# Workflow modules
+# ------------------------------------------------------------------------------
+# Rule definitions are kept in separate modules to make the pipeline easier to
+# maintain and extend.
+
+include: "workflow/workflow_RNAseq.smk"
+include: "workflow/qc_RNAseq.smk"

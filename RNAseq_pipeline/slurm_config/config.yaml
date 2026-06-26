@@ -1,0 +1,13 @@
+jobs: 1000
+
+cluster: "sbatch $(./slurm_config/parseJobID.sh {dependencies}) \
+--job-name={params.job_name} \
+--partition=standard \
+--time={resources.time_min} \
+--nodes=1 \
+--ntasks=1 \
+--cpus-per-task={resources.cpus} \
+--mem={resources.mem_gb}G \
+--mail-type=FAIL \
+--output=\"./logs/slurm/{params.job_name}-%j.out\" \
+--error=\"./logs/slurm/{params.job_name}-%j.err\""

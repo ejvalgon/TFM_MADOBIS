@@ -1,0 +1,174 @@
+# ------------------------------------------------------------------------------
+# General project settings
+# ------------------------------------------------------------------------------
+
+# Project or dataset identifier.
+# This value is used to build informative output names, job names and log labels.
+GSE: "RNAseq_JOB_NAME"
+
+# Sequencing layout of the input FASTQ files.
+# Options:
+#   "PAIRED" - paired-end sequencing data.
+#   "SINGLE" - single-end sequencing data.
+layout: "PAIRED"
+
+# Main organism analysed by the pipeline.
+# This value must match one of the organism-specific reference blocks below.
+organism: "homo_sapiens"
+
+# FASTQ file extension used to detect input files.
+# Examples: "fastq.gz", "fq.gz", "fastq" or "fq".
+ext: "fastq.gz"
+
+# Optional list of samples to process.
+# Sample names must match the FASTQ prefix without read-pair suffixes such as
+# _R1_001, _R2_001, _R1 or _R2.
+#
+# If this list is empty or not defined, all samples found in raw_fastq are
+# processed.
+select_samples: []
+
+# ------------------------------------------------------------------------------
+# Input and output paths
+# ------------------------------------------------------------------------------
+
+paths:
+  # Directory containing raw FASTQ files.
+  raw_fastq: "path/to/raw_fastq"
+
+  # Main output directory for generated workflow files.
+  out_root: "path/to/output_directory"
+
+  # Directory used to store rule-specific log files and benchmark reports.
+  log_root: "path/to/log_directory"
+
+# ------------------------------------------------------------------------------
+# Organism-specific reference settings
+# ------------------------------------------------------------------------------
+
+homo_sapiens:
+  # STAR index generated for RNA-seq using the hg38 FASTA and GTF annotation.
+  star_genome: "path/to/STAR_index"
+
+  # Gene annotation used by featureCounts.
+  gtf: "path/to/annotation.gtf"
+
+  # Optional reference FASTA kept for documentation or future modules.
+  reference_fasta: "path/to/reference_genome.fa"
+
+# ------------------------------------------------------------------------------
+# Alignments settings
+# ------------------------------------------------------------------------------
+
+# Maximum intron length allowed by STAR during splice-aware alignment.
+# STAR uses 0 as its automatic/default setting. For this hg38 GTF annotation,
+# the longest annotated intron detected was 1,240,120 bp, so 1,500,000 can be
+# used as an explicit conservative upper limit if desired.
+star_align_intron_max: 1500000
+
+# ------------------------------------------------------------------------------
+# featureCounts settings
+# ------------------------------------------------------------------------------
+
+# Strandedness used by featureCounts:
+#   0 = unstranded
+#   1 = stranded
+#   2 = reversely stranded
+featurecounts_strand: 0
+
+# ------------------------------------------------------------------------------
+# bigWig coverage settings
+# ------------------------------------------------------------------------------
+
+# Normalization method used by deepTools bamCoverage.
+# Common options:
+#   "CPM"  - counts per million mapped reads
+#   "RPKM" - reads per kilobase per million mapped reads
+#   "BPM"  - bins per million mapped reads
+bamcoverage_normalization: "CPM"
+
+# Bin size used to generate bigWig coverage tracks.
+# A value of 1 keeps base-level resolution.
+bamcoverage_bin_size: 1
+
+# Bin size used for genome-wide summary matrices for PCA/correlation.
+# This is intentionally much larger than the bigWig bin size.
+multiBamSummary_binSize: 100000
+multiBigwigSummary_binSize: 100000
+
+# ------------------------------------------------------------------------------
+# Custom resource settings
+# ------------------------------------------------------------------------------
+# Optional overrides for rule-specific runtime resources.
+#
+# Time values are in minutes. CPU values correspond to Snakemake threads.
+# If a parameter is not defined, the workflow uses the default value specified
+# inside each Snakemake rule through custom_param().
+
+# Read-level QC
+fastqc_time: 60
+fastqc_cpus: 2
+fastqc_mem_gb: 8
+
+# Adapter and quality trimming
+trim_time: 120
+trim_cpus: 4
+trim_mem_gb: 16
+
+# STAR alignment
+star_time: 180
+star_cpus: 16
+star_mem_gb: 128
+
+# BAM processing
+process_bam_time: 60
+process_bam_cpus: 4
+process_bam_mem_gb: 16
+
+# Gene-level quantification
+featurecounts_time: 120
+featurecounts_cpus: 8
+featurecounts_mem_gb: 32
+
+# bigWig coverage generation
+bamcoverage_time: 120
+bamcoverage_cpus: 4
+bamcoverage_mem_gb: 16
+
+# Genome-wide BAM summary
+multiBamSummary_time: 120
+multiBamSummary_cpus: 12
+multiBamSummary_mem_gb: 32
+
+# Genome-wide bigWig summary
+multiBigwigSummary_time: 120
+multiBigwigSummary_cpus: 8
+multiBigwigSummary_mem_gb: 32
+
+# Alignment QC
+samtools_qc_time: 30
+samtools_qc_cpus: 2
+samtools_qc_mem_gb: 8
+
+# Reproducibility QC from multiBamSummary
+plot_correlation_multibam_time: 30
+plot_correlation_multibam_cpus: 1
+plot_correlation_multibam_mem_gb: 16
+
+plot_pca_multibam_time: 30
+plot_pca_multibam_cpus: 1
+plot_pca_multibam_mem_gb: 16
+
+# Reproducibility QC from multiBigwigSummary
+plot_correlation_multibw_time: 30
+plot_correlation_multibw_cpus: 1
+plot_correlation_multibw_mem_gb: 16
+
+plot_pca_multibw_time: 30
+plot_pca_multibw_cpus: 1
+plot_pca_multibw_mem_gb: 16
+
+# MultiQC report
+multiqc_time: 30
+multiqc_cpus: 1
+multiqc_mem_gb: 8

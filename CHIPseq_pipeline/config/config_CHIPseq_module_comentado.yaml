@@ -1,0 +1,246 @@
+# ------------------------------------------------------------------------------
+# General project settings
+# ------------------------------------------------------------------------------
+
+# Project or dataset identifier.
+# This value is mainly used to build informative job names and log labels.
+# Use a short and descriptive name without spaces.
+GSE: "RNA_pol_II_CHIPseq"
+
+# Sequencing layout of the input FASTQ files.
+# Options:
+#   "PAIRED" - paired-end sequencing data.
+#   "SINGLE" - single-end sequencing data.
+layout: "PAIRED"
+
+# Main organism analysed by the pipeline.
+# This value must match one of the organism-specific reference blocks defined
+# below, such as "homo_sapiens".
+organism: "homo_sapiens"
+
+# Enable or disable spike-in normalization.
+# Options:
+#   "yes" - align reads to a combined main-organism + spike-in reference,
+#           split BAM files by genome and generate spike-in-normalized bigWigs.
+#   "no"  - align reads only to the main organism reference and generate
+#           CPM-normalized bigWigs.
+spikeIN: "yes"
+
+# Aligner used for read mapping.
+# Options:
+#   "star"    - use STAR for ChIP-seq read alignment.
+#   "bowtie2" - use Bowtie2 for ChIP-seq read alignment.
+aligner: "star"
+
+# FASTQ file extension used to detect input files.
+# Examples: "fastq.gz", "fq.gz", "fastq" or "fq".
+ext: "fastq.gz"
+
+# Optional list of samples to process.
+# Sample names must match the FASTQ prefix without read-pair suffixes such as
+# _R1_001, _R2_001, _R1 or _R2.
+#
+# If this list is empty or not defined, all samples found in raw_fastq are
+# processed.
+select_samples:
+  - SPIKE10_1_S2
+  - SPIKE10_2_S3
+  - SPIKE20_S1
+
+# ------------------------------------------------------------------------------
+# Input and output paths
+# ------------------------------------------------------------------------------
+
+paths:
+  # Directory containing the raw FASTQ files.
+  # The pipeline will search this directory to detect input samples.
+  raw_fastq: "/path/to/raw_fastq"
+
+  # Main output directory for generated workflow files.
+  # This includes processed BAM files, bigWig tracks, QC outputs, peak calling
+  # results and intermediate analysis files.
+  out_root: "/path/to/work"
+
+  # Directory used to store rule-specific log files and benchmark reports.
+  # Keeping logs separate from large output files makes debugging and cluster
+  # monitoring easier.
+  log_root: "/path/to/logs"
+
+# ------------------------------------------------------------------------------
+# Organism-specific reference settings
+# ------------------------------------------------------------------------------
+
+homo_sapiens:
+  # STAR index for the main organism genome only.
+  # Required when aligner: "star" and spikeIN: "no".
+  # Not used when spikeIN: "yes".
+  star_genome: "/path/to/references/homo_sapiens/star_index"
+
+  # STAR index for the combined main-organism + spike-in genome.
+  # Required when aligner: "star" and spikeIN: "yes".
+  # Contig names must include the prefixes defined in main_prefix and spikein_prefix.
+  star_spike_in_genome: "/path/to/references/homo_sapiens_plus_spikein/star_index"
+
+  # Bowtie2 index prefix for the main organism genome only.
+  # Required when aligner: "bowtie2" and spikeIN: "no".
+  # Do not include the .1.bt2/.2.bt2 file extension.
+  bowtie2_index: "/path/to/references/homo_sapiens/bowtie2_index/genome"
+
+  # Bowtie2 index prefix for the combined main-organism + spike-in genome.
+  # Required when aligner: "bowtie2" and spikeIN: "yes".
+  # Do not include the .1.bt2/.2.bt2 file extension.
+  bowtie2_spike_in_index: "/path/to/references/homo_sapiens_plus_spikein/bowtie2_index/genome"
+  
+  # Prefix assigned to main-organism contigs in the combined reference.
+  # This prefix is removed after splitting the main-organism BAM.
+  # Example: "hs_" for Homo sapiens contigs such as hs_chr1.
+  main_prefix: "hs_"
+
+  # Prefix used to identify spike-in contigs in the combined reference genome.
+  # This prefix is kept in the spike-in BAM so spike-in chromosomes remain clearly
+  # distinguishable after BAM splitting.
+  # Example: "sc_" for Saccharomyces cerevisiae contigs such as sc_chrI.
+  spikein_prefix: "sc_"
+
+  # BED file containing blacklisted genomic regions for the main organism.
+  # Used by deepTools to exclude blacklisted regions during coverage generation
+  # and by the QC module to estimate the fraction of reads in blacklist regions.
+  # Example: ENCODE blacklist for hg38.
+  blacklist_bed: "/path/to/references/homo_sapiens/hg38-blacklist.v2.bed"
+
+  # FASTA file for the main organism genome only.
+  # Used as reference by Picard tools when spikeIN: "no".
+  # This FASTA should match the genome used to build the non-spike-in aligner index.
+  reference_fasta: "/path/to/references/homo_sapiens/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+
+  # FASTA file for the combined main-organism + spike-in reference genome.
+  # Used as reference by Picard tools when spikeIN: "yes".
+  # This FASTA should match the combined genome used to build the spike-in aligner index.
+  # Contig names must include the prefixes defined in main_prefix and spikein_prefix.
+  reference_fasta_spike_in: "/path/to/references/homo_sapiens_plus_spikein/combined_reference.fa"
+
+  # Effective genome size used by deepTools bamCoverage when spike-in
+  # normalization is not enabled.
+  #
+  # In this pipeline, this value is only used when spikeIN: "no", together with
+  # CPM normalization and ignoreForNormalization.
+  #
+  # If chromosomes are ignored using ignoreForNormalization, this value should be
+  # consistent with the chromosomes included in the normalization background.
+  deeptools_genome_size: 3099750718
+
+  # Chromosomes ignored by deepTools when estimating the CPM normalization factor.
+  # In this pipeline, this option is only used when spikeIN: "no".
+  # Chromosome names must match the final BAM reference names.
+  #
+  # Example with UCSC-style chromosome names:
+  # ignoreForNormalization: "chrX chrY chrM"
+  #
+  # Example without "chr" prefix:
+  # ignoreForNormalization: "X Y MT"
+  ignoreForNormalization: "chrX chrY chrM"
+
+  # Effective genome size used by MACS3 for statistical peak calling.
+  # MACS3 uses this value to model the genomic background when estimating
+  # peak significance.
+  #
+  # For human data, MACS3 accepts the shortcut "hs". Alternatively, an explicit
+  # effective genome size value can be provided.
+  macs3_genome_size: "hs"
+
+# ------------------------------------------------------------------------------
+# Peak calling settings
+# ------------------------------------------------------------------------------
+
+# Enable or disable the peak calling module.
+# Options:
+#   "yes" - run MACS3 peak calling, consensus/union peak generation,
+#           peak counting, FRiP and peak-level QC.
+#   "no"  - skip all peak calling and peak-level analysis steps.
+calling_peaks: "no"
+
+# Metadata table required only when calling_peaks: "yes".
+# This table defines IP samples, optional input controls, experimental conditions,
+# ChIP targets/marks and peak type: "narrow", "broad", "both" or "none".
+metadata: "metadata/samples.tsv"
+
+macs3:
+  # q-value cutoff used by MACS3 for regular/narrow peak calling.
+  # Applied to samples with peak_type: "narrow" or "both".
+  narrow_cutoff: 0.05
+
+  # q-value cutoff used by MACS3 for broad peak calling.
+  # Applied to samples with peak_type: "broad" or "both".
+  broad_cutoff: 0.1
+
+consensus_peaks:
+  # Minimum number of biological replicates required to retain a region in the
+  # condition-level consensus peak set.
+  #
+  # If a group contains fewer peak files than this value, the threshold is
+  # automatically capped at the number of available peak files.
+  min_replicates: 2
+
+
+# ------------------------------------------------------------------------------
+# Custom resource settings
+# ------------------------------------------------------------------------------
+# Optional overrides for rule-specific runtime resources.
+#
+# Time values are in minutes. CPU values correspond to Snakemake threads.
+#
+# If any of these parameters are not defined, the pipeline will use the default
+# values specified inside each Snakemake rule through custom_param().
+#
+# Adjust these values according to dataset size, sequencing depth and the
+# available computing environment.
+
+# Note: only the main rules are listed below, but additional rule-specific
+# time and CPU overrides can be added using the same naming pattern.
+
+# Core processing workflow
+trim_time: 120
+trim_cpus: 4
+
+star_time: 180
+star_cpus: 16
+
+bowtie2_time: 180
+bowtie2_cpus: 16
+
+index_time: 90
+index_cpus: 2
+
+split_bam_time: 60
+split_bam_cpus: 1
+
+multiBamSummary_time: 120
+multiBamSummary_cpus: 12
+
+spikein_counts_time: 10
+spikein_counts_cpus: 1
+
+scale_factors_time: 10
+scale_factors_cpus: 1
+
+bigwig_time: 180
+bigwig_cpus: 12
+
+multiBigwigSummary_time: 120
+multiBigwigSummary_cpus: 8
+
+# Peak calling and peak-level analysis
+macs3_time: 120
+macs3_cpus: 2
+
+consensus_peaks_time: 30
+consensus_peaks_cpus: 1
+
+union_peaks_time: 30
+union_peaks_cpus: 1
+
+peak_qc_time: 20
+peak_qc_cpus: 1
+
+frip_time: 30
+frip_cpus: 2

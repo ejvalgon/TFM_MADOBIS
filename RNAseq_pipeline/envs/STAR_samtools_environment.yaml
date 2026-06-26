@@ -1,0 +1,35 @@
+name: /home/ejvalenzuela/Snakemake/RNAseq/.snakemake/conda/e554a5192a57d86d596a907c12ccdda6
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - _openmp_mutex=4.5
+  - bzip2=1.0.8
+  - c-ares=1.34.6
+  - ca-certificates=2026.5.20
+  - curl=7.87.0
+  - keyutils=1.6.3
+  - krb5=1.20.1
+  - libcurl=7.87.0
+  - libedit=3.1.20250104
+  - libev=4.33
+  - libgcc=15.2.0
+  - libgcc-ng=15.2.0
+  - libgomp=15.2.0
+  - liblzma=5.8.3
+  - liblzma-devel=5.8.3
+  - libnghttp2=1.51.0
+  - libssh2=1.10.0
+  - libstdcxx=15.2.0
+  - libstdcxx-ng=15.2.0
+  - libzlib=1.3.2
+  - ncurses=6.6
+  - openssl=1.1.1w
+  - samtools=1.5
+  - star=2.6.1d
+  - xz=5.8.3
+  - xz-gpl-tools=5.8.3
+  - xz-tools=5.8.3
+  - zlib=1.3.2
+prefix: /home/ejvalenzuela/Snakemake/RNAseq/.snakemake/conda/e554a5192a57d86d596a907c12ccdda6
